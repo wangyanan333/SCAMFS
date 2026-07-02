@@ -1,98 +1,253 @@
 function selfea = SCAMFS(data, L, delta1, delta2, k1, k2)
+
+
     [N, p] = size(data);
     num_feats = p - L;
+    
     label_indices = (num_feats + 1) : p;
     feature_indices = 1 : num_feats;
-    
-    % 预存所有特征数据，避免循环内多次访问大矩阵
+
     feat_data = data(:, 1:num_feats);
-    
-    % 简单的标签类别缓存（保留你认可的优化）
-    flattened_labels = struct();
+    label_classes = cell(1, L);
+    state_indices_by_label = cell(1, L);
+    flattened_labels = struct('orig_lbl_idx', {}, 'class_val', {}, 'bin_vec', {});
     class_count = 0;
-    for j = label_indices
-        u_vals = unique(data(:, j));
-        for d = 1:length(u_vals)
+    for i_cache = 1:L
+        lbl_idx = label_indices(i_cache);
+        u_vals = unique(data(:, lbl_idx));
+        label_classes{i_cache} = u_vals;
+        state_indices_by_label{i_cache} = zeros(1, length(u_vals));
+        for d_idx = 1:length(u_vals)
             class_count = class_count + 1;
-            flattened_labels(class_count).orig_lbl_idx = j;
-            flattened_labels(class_count).bin_vec = double(data(:, j) == u_vals(d));
+            state_indices_by_label{i_cache}(d_idx) = class_count;
+            flattened_labels(class_count).orig_lbl_idx = lbl_idx;
+            flattened_labels(class_count).class_val = u_vals(d_idx);
+            flattened_labels(class_count).bin_vec = double(data(:, lbl_idx) == u_vals(d_idx));
         end
     end
     num_total_classes = class_count;
 
+    MI_state_feature = zeros(num_total_classes, num_feats);
+    for s_idx = 1:num_total_classes
+        state_vec = flattened_labels(s_idx).bin_vec;
+        for f_idx = feature_indices
+            MI_state_feature(s_idx, f_idx) = SSMI(state_vec, feat_data(:, f_idx));
+        end
+    end
+    
     global_selected_features = [];
 
     for i = 1:L
         current_lbl_idx = label_indices(i);
-        u_classes = unique(data(:, current_lbl_idx));
+        unique_classes = label_classes{i};
         
-        for c_val = u_classes'
-            target_vec = double(data(:, current_lbl_idx) == c_val);
+        for c_idx = 1:length(unique_classes)
+            target_val = unique_classes(c_idx);
+            
+            target_vec = double(data(:, current_lbl_idx) == target_val);
+            
             if sum(target_vec) < 5, continue; end
+
+            target_state_idx = state_indices_by_label{i}(c_idx);
+            mi_target_feats = MI_state_feature(target_state_idx, :);
+
+            Matrix_Ric = []; 
             
-            % --- 优化点：一次性计算当前 target 与所有特征的 SSMI ---
-            mi_target_feats = zeros(1, num_feats);
-            for f = 1:num_feats
-                mi_target_feats(f) = SSMI(target_vec, feat_data(:, f), []);
+            cand_label_classes = []; 
+            
+            for cache_idx = 1:num_total_classes
+                if flattened_labels(cache_idx).orig_lbl_idx == current_lbl_idx
+                    continue;
+                end
+                val = DSMI(target_vec, flattened_labels(cache_idx).bin_vec);
+                if val > delta2
+                    cand_label_classes = [cand_label_classes; ...
+                        flattened_labels(cache_idx).orig_lbl_idx, ...
+                        flattened_labels(cache_idx).class_val, val, cache_idx];
+                end
             end
-            
-            % 1. Preprocessing (Matrix_Ric)
-            Matrix_Ric = [];
-            cand_lbls = [];
-            for k = 1:num_total_classes
-                if flattened_labels(k).orig_lbl_idx == current_lbl_idx, continue; end
-                val = DSMI(target_vec, flattened_labels(k).bin_vec, []);
-                if val > delta2, cand_lbls = [cand_lbls; k, val]; end
-            end
-            
-            if ~isempty(cand_lbls)
-                cand_lbls = sortrows(cand_lbls, -2);
-                % 仅取前几个最相关的，减少 CMI 负担 (Ca-MCF逻辑建议)
-                % 这里保持原样，但使用逻辑索引优化速度
-                for k = 1:size(cand_lbls, 1)
-                    vec_k = flattened_labels(cand_lbls(k,1)).bin_vec;
-                    if isempty(Matrix_Ric)
-                        Matrix_Ric = vec_k;
+
+            if ~isempty(cand_label_classes)
+                cand_label_classes = sortrows(cand_label_classes, -3);
+                
+                temp_cand_vecs = zeros(N, size(cand_label_classes, 1));
+                for k = 1:size(cand_label_classes, 1)
+                     temp_cand_vecs(:, k) = flattened_labels(cand_label_classes(k, 4)).bin_vec;
+                end
+                
+                selected_indices = [];
+                for k = 1:size(temp_cand_vecs, 2)
+                    current_cand_vec = temp_cand_vecs(:, k);
+                    
+                    if isempty(selected_indices)
+                        selected_indices = [selected_indices, k];
                     else
-                        if DSMI(target_vec, vec_k, Matrix_Ric) > delta2
-                            Matrix_Ric = [Matrix_Ric, vec_k];
+                        existing_data = temp_cand_vecs(:, selected_indices);
+                        val = DSMI(target_vec, current_cand_vec, existing_data);
+                        
+                        if val > delta2
+                            selected_indices = [selected_indices, k];
                         end
                     end
                 end
-            end
-            
-            % 2. Phase 1 (PC & Spouse)
-            % 使用逻辑索引替代 setdiff
-            potential_PC = find(mi_target_feats > delta1);
-            % fprintf('Target Class %d: 候选特征数 = %d\n', c_val, length(potential_PC));
-            PC_indices = [];
-            if ~isempty(potential_PC)
-                % ... 保持原有的 PC 筛选逻辑 ...
-                % 提示：在 cmi 调用前判断 Matrix_Ric 是否为空
-                PC_indices = potential_PC; % 简写演示
-            end
-            
-            % 4. Phase 3 (Redundancy Removal)
-            % 这是最耗时的地方，进行“逻辑短路”优化
-            final_MB = PC_indices; 
-            for f_k = PC_indices
-                val_curr = mi_target_feats(f_k);
-                if val_curr < 1e-6, continue; end % 极小值跳过
                 
-                is_red = false;
-                for k = 1:num_total_classes
-                    if flattened_labels(k).orig_lbl_idx == current_lbl_idx, continue; end
+                Matrix_Ric = temp_cand_vecs(:, selected_indices);
+            end
+
+            Cand_PC = [];
+            for f_idx = feature_indices
+                val = mi_target_feats(f_idx);
+                if val > delta1
+                    Cand_PC = [Cand_PC; f_idx, val];
+                end
+            end
+            
+            PC_indices = [];
+            if ~isempty(Cand_PC)
+                Cand_PC = sortrows(Cand_PC, -2);
+                num_keep_k1 = ceil(size(Cand_PC, 1) * k1);
+                Cand_PC = Cand_PC(1:num_keep_k1, :);
+                current_PC = Cand_PC(:, 1)';
+                
+                final_PC = current_PC;
+                for f_k = current_PC
+                    S = setdiff(final_PC, f_k);
+                    if isempty(S)
+                        Data_Cond = Matrix_Ric;
+                    else
+                        Data_Cond = [feat_data(:, S), Matrix_Ric];
+                    end
                     
-                    % 只有当特征与他类相关性可能超过当前类时才计算
-                    % 这里由于必须调用 mi，优化的空间在于提前跳过不必要的 target
-                    if SSMI(flattened_labels(k).bin_vec, feat_data(:, f_k), []) > (val_curr * 1.2)
-                        is_red = true; break;
+                    if isempty(Data_Cond)
+                        val = mi_target_feats(f_k);
+                    else
+                        val = SSMI(target_vec, feat_data(:, f_k), Data_Cond);
+                    end
+                    
+                    if val <= delta1
+                        final_PC(final_PC == f_k) = [];
                     end
                 end
-                if is_red, final_MB(final_MB == f_k) = []; end
+                PC_indices = final_PC;
             end
-            global_selected_features = [global_selected_features, final_MB];
-        end
+            
+            candidates_Z = setdiff(feature_indices, PC_indices);
+            v1_cache = zeros(1, num_feats);
+            if isempty(Matrix_Ric)
+                v1_cache(candidates_Z) = mi_target_feats(candidates_Z);
+            else
+                for z_node = candidates_Z
+                    v1_cache(z_node) = SSMI(target_vec, feat_data(:, z_node), Matrix_Ric);
+                end
+            end
+            spouse_candidates = candidates_Z(v1_cache(candidates_Z) <= delta1);
+            SP_mask = false(1, num_feats);
+            
+            for x_node = PC_indices
+                if isempty(Matrix_Ric)
+                    Cond_XR = feat_data(:, x_node);
+                else
+                    Cond_XR = [feat_data(:, x_node), Matrix_Ric];
+                end
+
+                for z_node = spouse_candidates
+                    val2 = SSMI(target_vec, feat_data(:, z_node), Cond_XR);
+                    
+                    if val2 > delta1
+                        SP_mask(z_node) = true;
+                    end
+                end
+            end
+            SP_indices = find(SP_mask);
+
+            CMB_indices = unique([PC_indices, SP_indices]);
+            
+            if ~isempty(Matrix_Ric)
+                num_ric = size(Matrix_Ric, 2);
+                keep_ric_mask = true(1, num_ric);
+                
+                F_miss_candidates = setdiff(feature_indices, CMB_indices);
+                S_base_cache = cell(1, num_ric);
+                val_block_cache = zeros(1, num_ric);
+                for r_i = 1:num_ric
+                    other_ric_idx = setdiff(1:num_ric, r_i);
+                    S_base_cache{r_i} = [feat_data(:, PC_indices), Matrix_Ric(:, other_ric_idx)];
+                    Y_block_vec = Matrix_Ric(:, r_i);
+                    if isempty(S_base_cache{r_i})
+                        val_block_cache(r_i) = DSMI(target_vec, Y_block_vec);
+                    else
+                        val_block_cache(r_i) = DSMI(target_vec, Y_block_vec, S_base_cache{r_i});
+                    end
+                end
+                
+                for f_miss = F_miss_candidates
+                    if mi_target_feats(f_miss) < delta1, continue; end
+                    
+                    replaced_flag = false;
+                    for r_i = 1:num_ric
+                        if ~keep_ric_mask(r_i), continue; end
+                        
+                        Data_S_base = S_base_cache{r_i};
+
+                        if isempty(Data_S_base)
+                            val_feat = mi_target_feats(f_miss);
+                        else
+                            val_feat = SSMI(target_vec, feat_data(:, f_miss), Data_S_base);
+                        end
+                        val_block = val_block_cache(r_i);
+                        
+                        if val_feat > val_block
+                            CMB_indices = [CMB_indices, f_miss];
+                            keep_ric_mask(r_i) = false;
+                            replaced_flag = true;
+                            break; 
+                        end
+                    end
+                    if replaced_flag, break; end
+                end
+            end
+            
+            current_CMB = CMB_indices;
+            scores = zeros(length(current_CMB), 1);
+            for k = 1:length(current_CMB)
+                elem = current_CMB(k);
+                scores(k) = mi_target_feats(elem);
+            end
+            [~, sort_idx] = sort(scores, 'descend');
+            sorted_CMB = current_CMB(sort_idx);
+            
+            num_keep = ceil(length(sorted_CMB) * k2);
+            top_CMB = sorted_CMB(1:num_keep);
+            
+            final_CMB_symmetry = top_CMB(mi_target_feats(top_CMB) > delta1);
+            CMB_indices = final_CMB_symmetry;
+
+            final_MB_clean = CMB_indices;
+            for f_k = CMB_indices
+                val_current = mi_target_feats(f_k);
+                is_redundant = false;
+                
+                for cache_idx = 1:num_total_classes
+                    if flattened_labels(cache_idx).orig_lbl_idx == current_lbl_idx
+                        continue;
+                    end
+                    val_other = MI_state_feature(cache_idx, f_k); 
+                    
+                    if val_other > (val_current * 1.2)
+                        is_redundant = true;
+                        break;
+                    end
+                end
+                
+                if is_redundant
+                    final_MB_clean(final_MB_clean == f_k) = [];
+                end
+            end
+
+            global_selected_features = [global_selected_features, final_MB_clean];
+            
+        end 
     end
+    
     selfea = unique(global_selected_features);
 end

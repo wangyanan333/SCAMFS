@@ -1,6 +1,4 @@
 function selfea = SCAMFS(data, L, delta1, delta2, k1, k2)
-
-
     [N, p] = size(data);
     num_feats = p - L;
     

@@ -1,7 +1,4 @@
 function val = DSMI(state1, state2, cond)
-% DSMI: Differential State Mutual Information
-% Handles State and State
-% If 'cond' is not provided, it calculates unconditional MI.
     if nargin < 3 || isempty(cond)
         hX = h(state1);
         hY = h(state2);

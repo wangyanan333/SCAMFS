@@ -1,22 +1,29 @@
-function val = DSMI(target_state_Sic, state_Sjd, conditioning_set_S)
+function val = DSMI(state1, state2, cond)
 % DSMI: Differential State Mutual Information
-    h_YZ = h_multivariate([state_Sjd, conditioning_set_S]);
-    h_XZ = h_multivariate([target_state_Sic, conditioning_set_S]);
-    h_Z  = h(conditioning_set_S);
-    h_YXZ = h_multivariate([state_Sjd, target_state_Sic, conditioning_set_S]);
+% Handles State and State
+% If 'cond' is not provided, it calculates unconditional MI.
+    if nargin < 3 || isempty(cond)
+        hX = h(state1);
+        hY = h(state2);
+        joint_data = [state1(:), state2(:)];   
+        [~, ~, uidx] = unique(joint_data, 'rows');
+        p_xy = accumarray(uidx, 1) / size(joint_data, 1);
+        hXY = -sum(p_xy .* log2(p_xy)); 
+        iXY = hX + hY - hXY;
+        val = iXY;
+    else
+        h_f1_f2 = h_multivariate([state1, state2]);
+        h_l_f2 = h_multivariate([cond, state2]);
+        h_f2 = h(state2);
+        h_f1_l_f2 = h_multivariate([state1, cond, state2]);
     
-    val = h_YZ + h_XZ - h_Z - h_YXZ;
+        iXYZ = h_f1_f2 + h_l_f2 - h_f2 - h_f1_l_f2;
+        val = iXYZ;
+    end
 end
+
 function H = h_multivariate(data)
     [~, ~, uidx] = unique(data, 'rows');
     p = accumarray(uidx, 1) / size(data, 1);
     H = -sum(p .* log2(p));
-end
-
-function H = h(data)
-    if isempty(data)
-        H = 0;
-        return;
-    end
-    H = h_multivariate(data);
 end
